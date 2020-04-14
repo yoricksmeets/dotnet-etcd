@@ -31,6 +31,7 @@ Advanced uses take advantage of the consistency guarantees to implement database
     <PackageLicenseFile>LICENSE.md</PackageLicenseFile>
     <PackageIconUrl />
     <PackageIcon>etcd-logo-rectangle.png</PackageIcon>
+    <LangVersion>latest</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>
