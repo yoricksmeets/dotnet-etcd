@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.Serialization;
 using System.Threading;
@@ -1189,8 +1190,22 @@ namespace dotnet_etcd
 
             internal WatchManager(EtcdClient etcdClient)
             {
-                etcdClientInstance = etcdClient;
-                channelRecreationTask = Task.Run(ChannelRecreation, cancellationTokenSource.Token);
+                WatchManagerInstanceName = $"wm-{Guid.NewGuid():n}";
+                _etcdClientInstance = etcdClient;
+
+                _requestSenderThread = new Thread(async () => await SenderThreadWork())
+                {
+                    Name = $"{WatchManagerInstanceName}-Sender"
+                };
+                _requestSenderThread.Start();
+
+                _responseReceiverThread = new Thread(async () => await ReceiverThreadWork())
+                {
+                    Name = $"{WatchManagerInstanceName}-Receiver"
+                };
+                _responseReceiverThread.Start();
+
+                _channelRecreationTask = Task.Run(ChannelRecreation, _watchManagerCancellationTokenSource.Token);
             }
 
             /// <summary>
@@ -1198,52 +1213,45 @@ namespace dotnet_etcd
             /// </summary>
             public event EventHandler<WatchResponseProcessingException> WatchResponseProcessingFailed;
 
-            public Metadata ChannelMetadata { get; private set; }
+            /// <summary>
+            /// The name of the current <seealso cref="WatchManager"/>
+            /// </summary>
+            public string WatchManagerInstanceName { get; }
 
-            private readonly Dictionary<long, Subscription> activeSubscriptions = new Dictionary<long, Subscription>();
-            private readonly CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
-            private readonly ManualResetEvent newSubscriptionsAccepted = new ManualResetEvent(false);
-            private readonly ManualResetEvent reinitializeChannel = new ManualResetEvent(true);
-            private readonly AutoResetEvent synchronousWriteToRequestStream = new AutoResetEvent(true);
-            private readonly EtcdClient etcdClientInstance;
-            private readonly Task channelRecreationTask;
-            
-            private long watchIdCounter = 1;
-            private AsyncDuplexStreamingCall<WatchRequest, WatchResponse> activeChannel;
-            private Task responseReaderTask;
-            private CancellationTokenSource responseReaderTaskCancellationTokenSource;
+            private readonly EtcdClient _etcdClientInstance;
+
+            private readonly CancellationTokenSource _watchManagerCancellationTokenSource = new CancellationTokenSource();
+            private readonly AutoResetEvent _reinitializeChannel = new AutoResetEvent(true);
+            private readonly ManualResetEvent _channelReady = new ManualResetEvent(false);
+            private readonly ConcurrentDictionary<long, Subscription> activeSubscriptions = new ConcurrentDictionary<long, Subscription>();
+            private readonly BlockingCollection<WatchRequest> _outgoingMessagesQueue = new BlockingCollection<WatchRequest>(new ConcurrentQueue<WatchRequest>());
+
+            private readonly Task _channelRecreationTask; // Keep a reference to the Task
+            private readonly Thread _responseReceiverThread;
+            private readonly Thread _requestSenderThread;
+
+            private long _watchIdCounter;
+            private AsyncDuplexStreamingCall<WatchRequest, WatchResponse> _activeChannel;
 
             /// <summary>
             /// Create a new watch subscription
             /// </summary>
             /// <param name="watchCreationRequest">The watch creation request to send to the server</param>
-            /// <param name="watchResponseFunc">The function that is called when a update is received from the etcd server</param>
+            /// <param name="watchResponseFunc">The function that is called when a update is received from the etcd server. The object that is provided is a state object and can be initially set through the <paramref name="initialWatchResponseFuncStateObject"/></param>
+            /// <param name="initialWatchResponseFuncStateObject">Optional initial state for the state object that is passed between all calls to <paramref name="watchResponseFunc"/></param>
             /// <param name="watchResponseFuncExceptionHandlerFunc">Optional exception handler that is called when an error is encountered in the execution of the <paramref name="watchResponseFunc"/>. This this action throws an error it's silently discarded.</param>
             /// <returns>A <seealso cref="Subscription"/> that manages the created watch</returns>
-            public Subscription CreateSubscription(WatchCreateRequest watchCreationRequest, Action<WatchManager.SubscriptionUpdate> watchResponseFunc, Action<Exception> watchResponseFuncExceptionHandlerFunc = null)
+            public Subscription CreateSubscription(WatchCreateRequest watchCreationRequest, Action<WatchManager.SubscriptionUpdate, object> watchResponseFunc, object initialWatchResponseFuncStateObject = null, Action<Exception> watchResponseFuncExceptionHandlerFunc = null)
             {
-                return AsyncHelper.RunSync(async () => await CreateSubscriptionAsync(watchCreationRequest, watchResponseFunc, watchResponseFuncExceptionHandlerFunc));
-            }
+                if (watchCreationRequest.WatchId != default)
+                {
+                    throw new ArgumentException($"WatchId cannot be set because it is managed by {nameof(WatchManager)}", nameof(watchCreationRequest));
+                }
 
-            /// <summary>
-            /// Create a new watch subscription
-            /// </summary>
-            /// <param name="watchCreationRequest">The watch creation request to send to the server</param>
-            /// <param name="watchResponseFunc">The function that is called when a update is received from the etcd server</param>
-            /// <param name="watchResponseFuncExceptionHandlerFunc">Optional exception handler that is called when an error is encountered in the execution of the <paramref name="watchResponseFunc"/>. This this action throws an error it's silently discarded.</param>
-            /// <returns>A <seealso cref="Subscription"/> that manages the created watch</returns>
-            public async Task<Subscription> CreateSubscriptionAsync(WatchCreateRequest watchCreationRequest, Action<WatchManager.SubscriptionUpdate> watchResponseFunc, Action<Exception> watchResponseFuncExceptionHandlerFunc = null)
-            {
-                // Wait for the new subscriptions block to be removed
-                newSubscriptionsAccepted.WaitOne();
-
-                var watchId = GetWatchId();
-                var subscription = new Subscription(this, watchId, watchCreationRequest, watchResponseFunc, watchResponseFuncExceptionHandlerFunc, cancellationTokenSource.Token);
-                activeSubscriptions.Add(watchId, subscription);
-
-                // Only await the send of the request, the creation confirmation is received async
-                await SendSubscriptionWatchRequest(subscription);
-
+                var watchId = GetNextWatchId();
+                var subscription = new Subscription(this, watchId, watchCreationRequest, watchResponseFunc, initialWatchResponseFuncStateObject, watchResponseFuncExceptionHandlerFunc, _watchManagerCancellationTokenSource.Token);
+                activeSubscriptions.TryAdd(watchId, subscription);
+                SendSubscriptionWatchRequest(subscription);
                 return subscription;
             }
 
@@ -1254,8 +1262,8 @@ namespace dotnet_etcd
                 if (!Disposing)
                 {
                     Disposing = true;
-                    cancellationTokenSource.Cancel();
-                    etcdClientInstance.RemoveWatchManager(this);
+                    _watchManagerCancellationTokenSource.Cancel();
+                    _etcdClientInstance.RemoveWatchManager(this);
 
                     // Stop all active subscriptions for this manager
                     foreach (var activeSubscription in activeSubscriptions)
@@ -1263,37 +1271,21 @@ namespace dotnet_etcd
                         activeSubscription.Value.Dispose();
                     }
 
-                    activeChannel?.Dispose();
-                    cancellationTokenSource.Dispose();
+                    _activeChannel?.Dispose();
+                    _watchManagerCancellationTokenSource.Dispose();
                 }
             }
 
-            private async Task SendSubscriptionWatchRequest(Subscription subscription)
+            private void SendSubscriptionWatchRequest(Subscription subscription)
             {
                 var watchRequest = subscription.CreateWatchCreateRequest();
-                synchronousWriteToRequestStream.WaitOne();
-                try
-                {
-                    await activeChannel.RequestStream.WriteAsync(watchRequest);
-                }
-                finally
-                {
-                    synchronousWriteToRequestStream.Set(); 
-                }
+                _outgoingMessagesQueue.Add(watchRequest);
             }
 
-            private async void RemoveSubscription(Subscription subscription)
+            private void RemoveSubscription(Subscription subscription)
             {
                 var watchRequest = subscription.CreateWatchCancelRequest();
-                synchronousWriteToRequestStream.WaitOne();
-                try
-                {
-                    await activeChannel.RequestStream.WriteAsync(watchRequest);
-                }
-                finally
-                {
-                    synchronousWriteToRequestStream.Set();
-                }
+                _outgoingMessagesQueue.Add(watchRequest);
             }
 
             private void HandleUpdateFromServer(WatchResponse response)
@@ -1303,6 +1295,10 @@ namespace dotnet_etcd
                     if (activeSubscriptions.TryGetValue(response.WatchId, out var subscription))
                     {
                         subscription.HandleUpdate(response);
+                    }
+                    else if (response.WatchId == -1)
+                    {
+                        // TODO generic update
                     }
                     else
                     {
@@ -1320,60 +1316,34 @@ namespace dotnet_etcd
                 }
             }
 
-            private async void ChannelRecreation()
+            private void ChannelRecreation()
             {
-                while (!cancellationTokenSource.Token.IsCancellationRequested)
+                while (!_watchManagerCancellationTokenSource.Token.IsCancellationRequested)
                 {
-                    reinitializeChannel.WaitOne();
+                    _reinitializeChannel.WaitOne();
+                    _channelReady.Reset();
+
+                    if (_watchManagerCancellationTokenSource.Token.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
                     try
                     {
-                        newSubscriptionsAccepted.Reset();
-
                         // Close and cleanup old channel
-                        ChannelMetadata = null;
-
-                        if (activeChannel != null)
+                        if (_activeChannel != null)
                         {
-                            activeChannel.Dispose();
-                            activeChannel = null;
+                            _activeChannel.Dispose();
+                            _activeChannel = null;
                         }
-
-                        if (responseReaderTaskCancellationTokenSource != null)
-                        {
-                            responseReaderTaskCancellationTokenSource.Cancel();
-                            responseReaderTaskCancellationTokenSource.Dispose();
-                            responseReaderTaskCancellationTokenSource = null;
-                        }
-
-                        responseReaderTask?.Dispose();
 
                         // Create and initialize a new channel
-                        var connection = etcdClientInstance._balancer.GetConnection();
-                        activeChannel = connection.watchClient.Watch(cancellationToken: cancellationTokenSource.Token);
-                        ChannelMetadata = await activeChannel.ResponseHeadersAsync;
-                        responseReaderTaskCancellationTokenSource = new CancellationTokenSource();
-                        responseReaderTask = Task.Run(async () =>
-                        {
-                            try
-                            {
-                                while (await activeChannel.ResponseStream.MoveNext(responseReaderTaskCancellationTokenSource.Token))
-                                {
-                                    var update = activeChannel.ResponseStream.Current;
-                                    HandleUpdateFromServer(update);
-                                }
-                            }
-                            catch (RpcException ex) when (ex.StatusCode == StatusCode.Unavailable)
-                            {
-                                // trigger a channel recreation
-                                reinitializeChannel.Set();
-                            }
-                        }, responseReaderTaskCancellationTokenSource.Token);
-
-                        newSubscriptionsAccepted.Set();
+                        var connection = _etcdClientInstance._balancer.GetConnection();
+                        _activeChannel = connection.watchClient.Watch(cancellationToken: _watchManagerCancellationTokenSource.Token);
 
                         foreach (var activeSubscription in activeSubscriptions.Values)
                         {
-                            await SendSubscriptionWatchRequest(activeSubscription);
+                            SendSubscriptionWatchRequest(activeSubscription);
                         }
                     }
                     catch
@@ -1381,14 +1351,79 @@ namespace dotnet_etcd
                         // reinitialization of channel failed, will try again
                         continue;
                     }
-
-                    reinitializeChannel.Reset();
+                    _channelReady.Set();
                 }
             }
 
-            private long GetWatchId()
+            private async Task SenderThreadWork()
             {
-                return Interlocked.Increment(ref watchIdCounter);
+                while (!_watchManagerCancellationTokenSource.Token.IsCancellationRequested)
+                {
+                    await SendMessagesFromOutgoingQueue();
+                }
+
+                async Task SendMessagesFromOutgoingQueue()
+                {
+                    WatchRequest watchRequest = null;
+                    try
+                    {
+                        _channelReady.WaitOne();
+                        while (!_watchManagerCancellationTokenSource.Token.IsCancellationRequested)
+                        {
+                            if (_outgoingMessagesQueue.TryTake(out var wr))
+                            {
+                                await _activeChannel.RequestStream.WriteAsync(wr);
+                            }
+                        }
+                    }
+                    catch // (RpcException ex) when (ex.StatusCode == StatusCode.Unavailable)
+                    {
+                        if (watchRequest != null)
+                        {
+                            _outgoingMessagesQueue.Add(watchRequest);
+                        }
+
+                        // trigger a channel recreation
+                        _channelReady.Reset();
+                        _reinitializeChannel.Set();
+                    }
+                }
+            }            
+            
+            private async Task ReceiverThreadWork()
+            {
+                while (!_watchManagerCancellationTokenSource.Token.IsCancellationRequested)
+                {
+                    await ReceiveMessages();
+                }
+
+                async Task ReceiveMessages()
+                {
+                    try
+                    {
+                        _channelReady.WaitOne();
+                        while (await _activeChannel.ResponseStream.MoveNext(_watchManagerCancellationTokenSource.Token))
+                        {
+                            Console.WriteLine("[" + DateTimeOffset.Now.ToString("HH:mm:ss.fffffff") + "] Next item read from response stream");
+
+                            var update = _activeChannel.ResponseStream.Current;
+                            HandleUpdateFromServer(update);
+
+                            Console.WriteLine("[" + DateTimeOffset.Now.ToString("HH:mm:ss.fffffff") + "] ready to read next item from response stream");
+                        }
+                    }
+                    catch // (RpcException ex) when (ex.StatusCode == StatusCode.Unavailable)
+                    {
+                        // trigger a channel recreation
+                        _channelReady.Reset();
+                        _reinitializeChannel.Set();
+                    }
+                }
+            }
+
+            private long GetNextWatchId()
+            {
+                return Interlocked.Increment(ref _watchIdCounter);
             }
 
             /// <summary>
@@ -1396,42 +1431,44 @@ namespace dotnet_etcd
             /// </summary>
             public class Subscription : IDisposable
             {
-                internal Subscription(WatchManager watchManager, long watchId, WatchCreateRequest watchCreationRequest, Action<SubscriptionUpdate> watchResponseFunc,
-                    Action<Exception> watchResponseFuncExceptionHandlerFunc, CancellationToken cancellationToken)
+                internal Subscription(WatchManager watchManager, long watchId, WatchCreateRequest watchCreationRequest, Action<WatchManager.SubscriptionUpdate, object> watchResponseFunc, object initialStateObj,
+                    Action<Exception> watchResponseFuncExceptionHandlerFunc, CancellationToken watchManagerCancellationToken)
                 {
-                    this.watchManager = watchManager;
-                    this.watchId = watchId;
-                    this.initialWatchCreationRequest = watchCreationRequest;
-                    this.watchResponseFunc = watchResponseFunc;
-                    this.watchResponseFuncExceptionHandlerFunc = watchResponseFuncExceptionHandlerFunc;
-                    this.cancellationToken = cancellationToken;
+                    this._watchManager = watchManager;
+                    this._watchId = watchId;
+                    this._initialWatchCreationRequest = watchCreationRequest;
+                    this._watchResponseFunc = watchResponseFunc;
+                    this._stateObj = initialStateObj;
+                    this._watchResponseFuncExceptionHandlerFunc = watchResponseFuncExceptionHandlerFunc;
 
                     State = SubscriptionState.Creating;
-                    watchResponseQueue = new BlockingCollection<SubscriptionUpdate>(new ConcurrentQueue<SubscriptionUpdate>());
-                    watchResponseQueueHandleTask = Task.Run(HandleResponseQueue, cancellationToken);
+                    _watchResponseQueue = new BlockingCollection<SubscriptionUpdate>(new ConcurrentQueue<SubscriptionUpdate>());
+                    this._subscriptionCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(watchManagerCancellationToken);
+                    _watchResponseQueueHandleTask = Task.Run(HandleResponseQueue, _subscriptionCancellationTokenSource.Token);
                 }
 
-                private readonly WatchManager watchManager;
-                private readonly long watchId;
-                private readonly WatchCreateRequest initialWatchCreationRequest;
-                private readonly Action<SubscriptionUpdate> watchResponseFunc;
-                private readonly Action<Exception> watchResponseFuncExceptionHandlerFunc;
-                private readonly CancellationToken cancellationToken;
-                private readonly BlockingCollection<SubscriptionUpdate> watchResponseQueue;
-                private readonly Task watchResponseQueueHandleTask;
-
-
-                /// <summary>
-                /// nextRev is the minimum expected next revision
-                /// </summary>
-                private long? nextRevision = null;
-
-                private bool disposing = false;
 
                 /// <summary>
                 /// The current state of the subscription
                 /// </summary>
                 public SubscriptionState State { get; private set; }
+
+                private readonly WatchManager _watchManager;
+                private readonly long _watchId;
+                private readonly WatchCreateRequest _initialWatchCreationRequest;
+                private readonly Action<SubscriptionUpdate, object> _watchResponseFunc;
+                private readonly Action<Exception> _watchResponseFuncExceptionHandlerFunc;
+                private readonly CancellationTokenSource _subscriptionCancellationTokenSource;
+                private readonly BlockingCollection<SubscriptionUpdate> _watchResponseQueue;
+                private readonly Task _watchResponseQueueHandleTask;  // Keep a reference to the Task
+                private readonly object _stateObj;
+
+                /// <summary>
+                /// nextRev is the minimum expected next revision
+                /// </summary>
+                private long? _nextRevision;
+
+                private bool disposing = false;
 
                 /// <summary>
                 /// Handles updates from the etcd server for this watch subscription
@@ -1439,17 +1476,22 @@ namespace dotnet_etcd
                 /// <param name="response">The <seealso cref="WatchResponse"/> from the etcd server</param>
                 internal void HandleUpdate(WatchResponse response)
                 {
+                    var newEvents = response.Events
+                                            // filter events that are duplicates based on expected next revision
+                                            .Where(ev => !_nextRevision.HasValue || ev.Kv.ModRevision >= _nextRevision) 
+                                            .ToList();
+
                     if (response.Created)
                     {
                         State = SubscriptionState.Created;
-                        if (nextRevision == 0)
+                        if (_nextRevision == 0)
                         {
-                            nextRevision = response.Header.Revision;
+                            _nextRevision = response.Header.Revision + 1;
                         }
                     }
                     else
                     {
-                        nextRevision = response.Header.Revision;
+                        _nextRevision = response.Header.Revision + 1;
                     }
 
                     if (response.Canceled)
@@ -1457,24 +1499,23 @@ namespace dotnet_etcd
                         State = SubscriptionState.Canceled;
                     }
 
-                    var newEvents = response.Events
-                        .Where(ev => !nextRevision.HasValue || ev.Kv.ModRevision > nextRevision) // filter events that are duplicates based on expected next revision
-                        .ToList();
-
                     if (newEvents.Count > 0)
                     {
-                        watchResponseQueue.Add(new SubscriptionUpdate(response.Header, response.CompactRevision, newEvents), cancellationToken);
-                        nextRevision = response.Events.Last().Kv.ModRevision + 1;
+                        _watchResponseQueue.Add(new SubscriptionUpdate(response.Header, response.CompactRevision, newEvents), _subscriptionCancellationTokenSource.Token);
+                        _nextRevision = response.Events.Last().Kv.ModRevision + 1;
                     }
                 }
 
                 internal WatchRequest CreateWatchCreateRequest()
                 {
-                    var watchCreationRequest = new WatchCreateRequest(initialWatchCreationRequest);
-
-                    if (nextRevision.HasValue)
+                    var watchCreationRequest = new WatchCreateRequest(_initialWatchCreationRequest)
                     {
-                        watchCreationRequest.StartRevision = nextRevision.Value;
+                        WatchId = _watchId
+                    };
+
+                    if (_nextRevision.HasValue)
+                    {
+                        watchCreationRequest.StartRevision = _nextRevision.Value;
                     }
 
                     return new WatchRequest
@@ -1489,7 +1530,7 @@ namespace dotnet_etcd
                     {
                         CancelRequest = new WatchCancelRequest
                         {
-                            WatchId = watchId
+                            WatchId = _watchId
                         }
                     };
                 }
@@ -1499,27 +1540,47 @@ namespace dotnet_etcd
                 {
                     if (!disposing)
                     {
-                        watchManager.RemoveSubscription(this);
+                        _watchManager.RemoveSubscription(this);
                     }
+                    _subscriptionCancellationTokenSource.Cancel();
+                    _subscriptionCancellationTokenSource.Dispose();
+                    _watchResponseQueue?.Dispose();
+
+                    // _watchResponseQueueHandleTask needs to be in completed form before it can be disposed
+                    // the cancellation token that is added to the task on creation is cancelled so this should not take long
+                    //var sw = new Stopwatch();
+                    //sw.Start();
+                    //var w = _watchResponseQueueHandleTask?.Wait(TimeSpan.FromSeconds(1));
+                    //if (w == true)
+                    //{
+                    //    _watchResponseQueueHandleTask?.Dispose();
+                    //}
+                    //sw.Stop();
+                    //Console.WriteLine("[" + DateTimeOffset.Now.ToString("HH:mm:ss.fffffff") + $"] Waited for dispose of watch response queue task: {sw.Elapsed}");
                 }
+
 
                 private void HandleResponseQueue()
                 {
-                    foreach (var watchResponse in watchResponseQueue.GetConsumingEnumerable(cancellationToken))
+                    if (!_subscriptionCancellationTokenSource.IsCancellationRequested)
                     {
-                        try
-                        {
-                            watchResponseFunc?.Invoke(watchResponse);
-                        }
-                        catch (Exception ex)
+                        foreach (var watchResponse in _watchResponseQueue.GetConsumingEnumerable(_subscriptionCancellationTokenSource.Token))
                         {
                             try
                             {
-                                watchResponseFuncExceptionHandlerFunc?.Invoke(ex);
+                                //Console.WriteLine("[" + DateTimeOffset.Now.ToString("HH:mm:ss.fffffff") + "] Handle response queue item");
+                                _watchResponseFunc?.Invoke(watchResponse, _stateObj);
                             }
-                            catch
+                            catch (Exception ex)
                             {
-                                // exception handlers should not throw exceptions
+                                try
+                                {
+                                    _watchResponseFuncExceptionHandlerFunc?.Invoke(ex);
+                                }
+                                catch
+                                {
+                                    // exception handlers should not throw exceptions
+                                }
                             }
                         }
                     }
@@ -1588,7 +1649,6 @@ namespace dotnet_etcd
                 public List<Event> Events { get; }
             }
         }
-
         #endregion
     }
 }
